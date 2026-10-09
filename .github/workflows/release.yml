@@ -1,22 +1,32 @@
 name: Final workflow — Build, Release and libusque.so to rethink-app-masque
 
+# A deploy is a release with a higher version, and every deploy ships its
+# android/arm64 build to rethink-app-masque as libusque.so. Deploys come from:
+#   - a push to main (or b2): new version tag, release, libusque.so
+#   - "Run workflow" on main (or b2): the same, a new version even without new
+#     commits (a manual run used to only build, so nothing reached the app)
+#   - a release published by hand: its tag is built, the assets attached to it,
+#     and its android/arm64 build shipped
+# Pull requests only build.
 on:
   push:                        # auto-tag + release on every push to main/b2
     branches: [main, b2]
   pull_request:                # build-only check on PRs
   release:
     types: [published]         # also fires when a release is manually published
-  workflow_dispatch:
+  workflow_dispatch:           # a manual deploy: new version + release + libusque.so
 
 permissions:
   contents: write              # needed to create tags and releases
 
 jobs:
-  # ── Auto-tag: bump patch version on every push to main/b2 ────────────────
+  # ── Auto-tag: bump the version on every push or manual run on main/b2 ────
   auto-tag:
     name: Auto tag
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/b2')
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/b2')
     outputs:
       new_tag: ${{ steps.tag.outputs.new_tag }}
       new_version: ${{ steps.tag.outputs.new_version }}
@@ -60,16 +70,14 @@ jobs:
           curl -sL https://github.com/goreleaser/goreleaser/releases/latest/download/goreleaser_Linux_x86_64.tar.gz | tar xz -C /tmp
           sudo mv /tmp/goreleaser /usr/local/bin/
 
+      # Always a snapshot build: goreleaser.yml's own release target is the
+      # upstream repo (Diniboy1123), which this token cannot write to, so a
+      # non-snapshot run on a tag would fail. The jobs below publish the release
+      # and the app's libusque.so from these binaries instead.
       - name: Run GoReleaser
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            goreleaser release --clean
-          else
-            echo "::notice::no tag on this trigger — snapshot build, nothing published"
-            goreleaser release --snapshot --clean
-          fi
+        run: goreleaser release --snapshot --clean
 
       - name: Upload build artifacts
         if: always()
@@ -84,18 +92,18 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-  # ── Publish GitHub Release when a new tag was just created ───────────────
+  # ── Publish the GitHub Release for a new tag, or fill a hand-made one ────
   publish-release:
     name: Publish release
     runs-on: ubuntu-latest
     needs: [auto-tag, release]
-    if: needs.auto-tag.outputs.new_tag != ''
+    if: always() && needs.release.result == 'success' && (needs.auto-tag.outputs.new_tag != '' || github.event_name == 'release')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ needs.auto-tag.outputs.new_tag }}
+          ref: ${{ needs.auto-tag.outputs.new_tag || github.ref }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -104,6 +112,7 @@ jobs:
           path: dist/
 
       - name: Create GitHub Release
+        if: needs.auto-tag.outputs.new_tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.auto-tag.outputs.new_tag }}
@@ -114,9 +123,21 @@ jobs:
             dist/**/*.zip
             dist/**/checksums.txt
 
+      # A release published by hand keeps its own name and notes; only the
+      # binaries are added to it.
+      - name: Attach binaries to the published release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.zip
+            dist/**/checksums.txt
+
   # ── Ship the release's Android arm64 binary into the app ─────────────────
-  # Every deploy (a new version tag on main, released above) puts its
-  # android/arm64 build into <owner>/rethink-app-masque as
+  # Every deploy (a new version tag on main, or a release published by hand)
+  # puts its android/arm64 build into <owner>/rethink-app-masque as
   # app/src/main/jniLibs/arm64-v8a/libusque.so. The previous one is kept as
   # libusque.so.prev; libusque.so.bak is never touched.
   # Needs secret APP_REPO_TOKEN: a PAT with Contents read/write on the app repo
@@ -125,7 +146,10 @@ jobs:
     name: Publish libusque.so to rethink-app-masque
     runs-on: ubuntu-latest
     needs: [auto-tag, release, publish-release]
-    if: needs.auto-tag.outputs.new_tag != '' && github.ref == 'refs/heads/main'
+    if: >-
+      always() && needs.publish-release.result == 'success' &&
+      ((needs.auto-tag.outputs.new_tag != '' && github.ref == 'refs/heads/main') ||
+       github.event_name == 'release')
     permissions:
       contents: read
     concurrency:
@@ -133,7 +157,7 @@ jobs:
       group: publish-libusque-app
       cancel-in-progress: false
     env:
-      TAG: ${{ needs.auto-tag.outputs.new_tag }}
+      TAG: ${{ needs.auto-tag.outputs.new_tag || github.event.release.tag_name }}
     steps:
       - name: Download the release's binaries
         uses: actions/download-artifact@v4
