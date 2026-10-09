@@ -558,7 +558,6 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 				}
 			}
 		}(carry)
-		carry = nil
 
 		go func() {
 			defer wg.Done()
