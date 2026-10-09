@@ -2,12 +2,16 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"net/netip"
 	"os"
+	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/Diniboy1123/usque/api"
 	"github.com/Diniboy1123/usque/config"
 	"github.com/Diniboy1123/usque/internal"
 	"github.com/Diniboy1123/usque/internal/chain"
@@ -40,20 +44,7 @@ var chainCmd = &cobra.Command{
 		integer := func(n string) int { v, _ := f.GetInt(n); return v }
 		dur := func(n string) time.Duration { v, _ := f.GetDuration(n); return v }
 
-		wgPath, exitPath := str("wg"), str("exit-config")
-		if wgPath == "" || exitPath == "" {
-			log.Fatal("chain: --wg and --exit-config are required")
-		}
-		wgFile, err := os.Open(wgPath)
-		if err != nil {
-			log.Fatalf("chain: %v", err)
-		}
-		wgCfg, err := chain.ParseWGConfig(wgFile)
-		_ = wgFile.Close()
-		if err != nil {
-			log.Fatalf("chain: %s: %v", wgPath, err)
-		}
-		exitCfg, err := config.LoadConfigFile(exitPath)
+		wgCfg, exitCfg, err := chainKeys(str("wg"), str("exit-config"))
 		if err != nil {
 			log.Fatalf("chain: %v", err)
 		}
@@ -65,6 +56,13 @@ var chainCmd = &cobra.Command{
 		ips, _ := f.GetUint16("initial-packet-size")
 		insecure := boolean("insecure")
 		mtu1 := integer("mtu")
+		res := readResilienceFlags(cmd)
+
+		// Each hop's health is watched by the hop above it, which then leaves
+		// the recovery to the hop below instead of rebuilding itself on top.
+		warp1Health := new(api.Health)
+		// Set once wg0 exists; WARP1 reconnects nudge it (see WGStack.Nudge).
+		var wgStack atomic.Pointer[chain.WGStack]
 
 		// Hop 1: WARP1 over the host network.
 		warp1, err := chain.StartWarp(ctx, chain.WarpHop{
@@ -73,6 +71,15 @@ var chainCmd = &cobra.Command{
 			InitialPacketSize: ips, MTU: mtu1, Keepalive: dur("keepalive-period"),
 			ReconnectDelay: dur("reconnect-delay"), AlwaysReconnect: true, Insecure: insecure,
 			FallbackHTTP2After: integer("http2-fallback-after"),
+			IdleTimeout:        res.idleTimeout, ConnectTimeout: res.connectTimeout,
+			WatchPath: res.watchNetwork, StallTimeout: res.stallTimeout,
+			ProbeAddr: res.probeTarget(configAddrs(&config.AppConfig)),
+			Health:    warp1Health,
+			Connected: func() {
+				if w := wgStack.Load(); w != nil {
+					w.Nudge()
+				}
+			},
 		}, nil)
 		if err != nil {
 			log.Fatalf("chain: %v", err)
@@ -89,13 +96,15 @@ var chainCmd = &cobra.Command{
 		if boolean("wg-verbose") {
 			logLevel = device.LogLevelVerbose
 		}
-		wg0, wgMTU, err := chain.StartWG(ctx, chain.WGHop{
+		wg, err := chain.StartWG(ctx, chain.WGHop{
 			Config: wgCfg, UnderMTU: mtu1, Keepalive: integer("wg-keepalive"), MTU: integer("wg-mtu"),
 			Resolver: resolver, LogLevel: logLevel,
 		}, warp1)
 		if err != nil {
 			log.Fatalf("chain: %v", err)
 		}
+		wgStack.Store(wg)
+		wg0, wgMTU := wg.Net, wg.MTU
 
 		// Hop 3: WARP2 inside wg0.
 		exitHTTP2 := true
@@ -122,6 +131,9 @@ var chainCmd = &cobra.Command{
 			UseHTTP2: exitHTTP2, ConnectPort: integer("exit-connect-port"), InitialPacketSize: exitIPS, MTU: exitMTU,
 			Keepalive: dur("keepalive-period"), ReconnectDelay: dur("reconnect-delay"),
 			AlwaysReconnect: true, Insecure: insecure,
+			IdleTimeout: res.idleTimeout, ConnectTimeout: res.connectTimeout,
+			StallTimeout: dur("exit-stall-timeout"), ProbeAddr: res.probeTarget(configAddrs(exitCfg)),
+			UnderlayHealthy: warp1Health.Healthy,
 		}, wg0)
 		if err != nil {
 			log.Fatalf("chain: %v", err)
@@ -181,6 +193,56 @@ func init() {
 	f.DurationP("reconnect-delay", "r", 1*time.Second, "Delay between reconnect attempts")
 	f.Duration("udp-timeout", 60*time.Second, "Idle deadline for SOCKS5 UDP relays")
 	f.Bool("insecure", false, "Disable endpoint certificate pinning (testing only)")
+	f.Duration("exit-stall-timeout", 8*time.Second, "Like --stall-timeout, for WARP2 (inside wg0); only checked while WARP1 is healthy")
 	addDoHFlags(chainCmd)
+	addResilienceFlags(chainCmd)
 	rootCmd.AddCommand(chainCmd)
+}
+
+// chainKeys loads the wg0 config and the WARP2 identity, from the stdin key
+// bundle when --secrets-stdin is set, else from the --wg and --exit-config files.
+func chainKeys(wgPath, exitPath string) (*chain.WGConfig, *config.Config, error) {
+	if b := stdinSecrets; b != nil {
+		defer b.wipe()
+		if len(b.ExitConfig) == 0 || b.WG == "" {
+			return nil, nil, fmt.Errorf(`the key bundle needs "exit_config" and "wg" for the chain`)
+		}
+		wgCfg, err := chain.ParseWGConfig(strings.NewReader(b.WG))
+		if err != nil {
+			return nil, nil, fmt.Errorf("wg0: %w", err)
+		}
+		exitCfg, err := config.ParseConfig(b.ExitConfig)
+		if err != nil {
+			return nil, nil, fmt.Errorf("exit config: %w", err)
+		}
+		return wgCfg, exitCfg, nil
+	}
+	if wgPath == "" || exitPath == "" {
+		return nil, nil, fmt.Errorf("--wg and --exit-config are required")
+	}
+	wgFile, err := os.Open(wgPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	wgCfg, err := chain.ParseWGConfig(wgFile)
+	_ = wgFile.Close()
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", wgPath, err)
+	}
+	exitCfg, err := config.LoadConfigFile(exitPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return wgCfg, exitCfg, nil
+}
+
+// configAddrs returns the tunnel addresses a WARP identity is assigned.
+func configAddrs(c *config.Config) []netip.Addr {
+	var out []netip.Addr
+	for _, s := range []string{c.IPv4, c.IPv6} {
+		if a, err := netip.ParseAddr(s); err == nil {
+			out = append(out, a)
+		}
+	}
+	return out
 }

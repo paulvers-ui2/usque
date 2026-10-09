@@ -13,6 +13,15 @@ var rootCmd = &cobra.Command{
 	Short: "Usque Warp CLI",
 	Long:  "An unofficial Cloudflare Warp CLI that uses the MASQUE protocol and exposes the tunnel as various different services.",
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		hardenProcess()
+
+		if fromStdin, _ := cmd.Flags().GetBool("secrets-stdin"); fromStdin {
+			if err := loadSecretsFromStdin(); err != nil {
+				log.Fatalf("Failed to read keys from stdin: %v", err)
+			}
+			return
+		}
+
 		configPath, err := cmd.Flags().GetString("config")
 		if err != nil {
 			log.Fatalf("Failed to get config path: %v", err)
@@ -34,4 +43,5 @@ func Execute() error {
 func init() {
 	internal.InstallDefaultLogTZStamp()
 	rootCmd.PersistentFlags().StringP("config", "c", "config.json", "config file (default is config.json)")
+	rootCmd.PersistentFlags().Bool("secrets-stdin", false, `Read the keys from stdin instead of files, as JSON: {"config": <config.json>, "exit_config": <config.json>, "wg": "<wg-quick text>"} (the last two for chain only). -c, --exit-config and --wg are then ignored`)
 }

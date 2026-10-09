@@ -197,7 +197,8 @@ func SplitEndpoint(ep string) (string, uint16, error) {
 }
 
 // UAPI renders the config for wireguard-go's IpcSet with the peer endpoint
-// already resolved to ep.
+// already resolved to ep. An invalid ep leaves the endpoint unset until
+// EndpointUAPI sets it.
 func (c *WGConfig) UAPI(ep netip.AddrPort, keepalive int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "private_key=%s\n", hex.EncodeToString(c.PrivateKey[:]))
@@ -207,11 +208,19 @@ func (c *WGConfig) UAPI(ep netip.AddrPort, keepalive int) string {
 	if p.PresharedKey != nil {
 		fmt.Fprintf(&b, "preshared_key=%s\n", hex.EncodeToString(p.PresharedKey[:]))
 	}
-	fmt.Fprintf(&b, "endpoint=%s\n", ep.String())
+	if ep.IsValid() {
+		fmt.Fprintf(&b, "endpoint=%s\n", ep.String())
+	}
 	fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", keepalive)
 	fmt.Fprintf(&b, "replace_allowed_ips=true\n")
 	for _, a := range p.AllowedIPs {
 		fmt.Fprintf(&b, "allowed_ip=%s\n", a.String())
 	}
 	return b.String()
+}
+
+// EndpointUAPI points the (already configured) peer at ep and changes nothing
+// else.
+func (c *WGConfig) EndpointUAPI(ep netip.AddrPort) string {
+	return fmt.Sprintf("public_key=%s\nendpoint=%s\n", hex.EncodeToString(c.Peers[0].PublicKey[:]), ep.String())
 }

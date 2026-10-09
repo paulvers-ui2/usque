@@ -147,6 +147,16 @@ func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.
 // (nil = host network). The returned io.Closer is the UDP socket in HTTP/3
 // mode and nil in HTTP/2 mode.
 func ConnectTunnelOver(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.Config, connectUri string, endpoint net.Addr, useHTTP2 bool, ul *Underlay) (net.PacketConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
+	sock, tr, ipConn, rsp, _, err := connectTunnelOver(ctx, tlsConfig, quicConfig, connectUri, endpoint, useHTTP2, ul)
+	return sock, tr, ipConn, rsp, err
+}
+
+// connectTunnelOver is ConnectTunnelOver plus a release func for what closing
+// the returned conns does not free: in HTTP/2 mode the TCP+TLS connection stays
+// in the client's pool after the CONNECT stream ends, so a tunnel that
+// reconnects all day would pile up open connections. release is never nil.
+func connectTunnelOver(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.Config, connectUri string, endpoint net.Addr, useHTTP2 bool, ul *Underlay) (net.PacketConn, *http3.Transport, *connectip.Conn, *http.Response, func(), error) {
+	noRelease := func() {}
 	template := uritemplate.MustNew(connectUri)
 	additionalHeaders := http.Header{
 		"User-Agent": []string{""},
@@ -155,7 +165,7 @@ func ConnectTunnelOver(ctx context.Context, tlsConfig *tls.Config, quicConfig *q
 	if useHTTP2 {
 		h2Endpoint, ok := endpoint.(*net.TCPAddr)
 		if !ok || h2Endpoint == nil {
-			return nil, nil, nil, nil, errors.New("missing HTTP/2 TCP endpoint")
+			return nil, nil, nil, nil, noRelease, errors.New("missing HTTP/2 TCP endpoint")
 		}
 
 		h2Headers := additionalHeaders.Clone()
@@ -165,39 +175,41 @@ func ConnectTunnelOver(ctx context.Context, tlsConfig *tls.Config, quicConfig *q
 
 		h2Client, err := newHTTP2Client(tlsConfig, h2Endpoint, connectUri, ul)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("failed to create HTTP/2 client: %w", err)
+			return nil, nil, nil, nil, noRelease, fmt.Errorf("failed to create HTTP/2 client: %w", err)
 		}
+		release := h2Client.CloseIdleConnections
 
 		ipConn, rsp, err := connectip.DialH2(ctx, h2Client, template, h2Headers)
 		if err != nil {
+			release()
 			if strings.Contains(err.Error(), "tls: access denied") {
-				return nil, nil, nil, nil, errors.New("login failed! Please double-check if your tls key and cert is enrolled in the Cloudflare Access service")
+				return nil, nil, nil, nil, noRelease, errors.New("login failed! Please double-check if your tls key and cert is enrolled in the Cloudflare Access service")
 			}
-			return nil, nil, nil, nil, fmt.Errorf("failed to dial connect-ip over HTTP/2: %w", err)
+			return nil, nil, nil, nil, noRelease, fmt.Errorf("failed to dial connect-ip over HTTP/2: %w", err)
 		}
-		return nil, nil, ipConn, rsp, nil
+		return nil, nil, ipConn, rsp, release, nil
 	}
 
 	quicEndpoint, ok := endpoint.(*net.UDPAddr)
 	if !ok || quicEndpoint == nil {
-		return nil, nil, nil, nil, errors.New("missing HTTP/3 UDP endpoint")
+		return nil, nil, nil, nil, noRelease, errors.New("missing HTTP/3 UDP endpoint")
 	}
 
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		udpConn, tr, ipConn, rsp, err := connectTunnelHTTP3(ctx, tlsConfig, quicConfig, template, additionalHeaders, quicEndpoint, ul)
 		if err == nil {
-			return udpConn, tr, ipConn, rsp, nil
+			return udpConn, tr, ipConn, rsp, noRelease, nil
 		}
 		if strings.Contains(err.Error(), "tls: access denied") {
-			return nil, nil, nil, nil, errors.New("login failed! Please double-check if your tls key and cert is enrolled in the Cloudflare Access service")
+			return nil, nil, nil, nil, noRelease, errors.New("login failed! Please double-check if your tls key and cert is enrolled in the Cloudflare Access service")
 		}
 		lastErr = err
 		if !isRetryableHTTP3ConnectFailure(err) {
 			break
 		}
 	}
-	return nil, nil, nil, nil, fmt.Errorf("failed to dial connect-ip: %w", lastErr)
+	return nil, nil, nil, nil, noRelease, fmt.Errorf("failed to dial connect-ip: %w", lastErr)
 }
 
 func connectTunnelHTTP3(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.Config, template *uritemplate.Template, additionalHeaders http.Header, endpoint *net.UDPAddr, ul *Underlay) (net.PacketConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
