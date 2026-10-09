@@ -248,6 +248,11 @@ var socksCmd = &cobra.Command{
 		}
 		defer func() { _ = tunDev.Close() }()
 
+		res := readResilienceFlags(cmd)
+		var probe func(context.Context) error
+		if res.stallTimeout > 0 {
+			probe = api.TCPProbe(tunNet.DialContext, res.probeTarget(localAddresses))
+		}
 		go api.MaintainTunnel(context.Background(), api.MaintainTunnelConfig{
 			TLSConfig:         tlsConfig,
 			KeepalivePeriod:   keepalivePeriod,
@@ -261,6 +266,11 @@ var socksCmd = &cobra.Command{
 			OnConnect:         onConnect,
 			OnDisconnect:      onDisconnect,
 			HookEnv:           hookEnv,
+			IdleTimeout:       res.idleTimeout,
+			ConnectTimeout:    res.connectTimeout,
+			WatchPath:         res.watchNetwork,
+			Probe:             probe,
+			StallTimeout:      res.stallTimeout,
 		})
 
 		// DoH queries go through the tunnel, or over the host network with -l.
@@ -331,5 +341,6 @@ func init() {
 	socksCmd.Flags().String("on-connect", "", "Path to an executable to run after each successful tunnel connect (no args; context via USQUE_* env vars)")
 	socksCmd.Flags().String("on-disconnect", "", "Path to an executable to run after each tunnel disconnect (no args; context via USQUE_* env vars)")
 	addDoHFlags(socksCmd)
+	addResilienceFlags(socksCmd)
 	rootCmd.AddCommand(socksCmd)
 }

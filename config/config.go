@@ -54,6 +54,27 @@ func LoadConfig(configPath string) error {
 	return nil
 }
 
+// LoadConfigBytes is LoadConfig for a configuration already in memory (e.g. one
+// passed through stdin, see the --secrets-stdin flag).
+func LoadConfigBytes(data []byte) error {
+	c, err := ParseConfig(data)
+	if err != nil {
+		return err
+	}
+	AppConfig = *c
+	ConfigLoaded = true
+	return nil
+}
+
+// ParseConfig decodes a configuration JSON document into a new Config.
+func ParseConfig(data []byte) (*Config, error) {
+	var c Config
+	if err := json.Unmarshal(data, &c); err != nil {
+		return nil, fmt.Errorf("failed to decode config: %v", err)
+	}
+	return &c, nil
+}
+
 // LoadConfigFile reads a configuration JSON file into a new Config without
 // touching the global AppConfig. Used when more than one WARP identity is in
 // play (e.g. the exit hop of the chain command).

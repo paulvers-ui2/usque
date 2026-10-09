@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,6 +52,21 @@ type WarpHop struct {
 	// connects in a row (0 = never). Meant for WARP1, the only hop on the host
 	// network, where UDP 443 may be dropped or throttled.
 	FallbackHTTP2After int
+
+	// IdleTimeout, ConnectTimeout, WatchPath and StallTimeout: see
+	// api.MaintainTunnelConfig. WatchPath only applies to a hop on the host
+	// network. The stall probe connects to ProbeAddr through this hop.
+	IdleTimeout    time.Duration
+	ConnectTimeout time.Duration
+	WatchPath      bool
+	StallTimeout   time.Duration
+	ProbeAddr      string
+	// Health is kept up to date for the hop above; UnderlayHealthy is the hop
+	// below's, so this hop does not rebuild itself for an outage down there.
+	Health          *api.Health
+	UnderlayHealthy func() bool
+	// Connected runs after every successful connect of this hop.
+	Connected func()
 }
 
 // UnderlayOf makes a tunnel's stack usable as the transport of the next hop.
@@ -145,6 +161,10 @@ func startWarpTLS(ctx context.Context, h WarpHop, tlsConfig *tls.Config, under *
 		transport = fmt.Sprintf("HTTP/3 (HTTP/2 after %d failed connects)", h.FallbackHTTP2After)
 	}
 	log.Printf("chain: %s up: %s via %s, tunnel MTU %d", h.Name, endpoint, transport, h.MTU)
+	var probe func(context.Context) error
+	if h.StallTimeout > 0 && h.ProbeAddr != "" {
+		probe = api.TCPProbe(tnet.DialContext, h.ProbeAddr)
+	}
 	go api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
 		TLSConfig:         tlsConfig,
 		KeepalivePeriod:   h.Keepalive,
@@ -159,6 +179,15 @@ func startWarpTLS(ctx context.Context, h WarpHop, tlsConfig *tls.Config, under *
 
 		FallbackHTTP2Endpoint: fallback,
 		FallbackHTTP2After:    h.FallbackHTTP2After,
+
+		IdleTimeout:     h.IdleTimeout,
+		ConnectTimeout:  h.ConnectTimeout,
+		WatchPath:       h.WatchPath && under == nil,
+		Probe:           probe,
+		StallTimeout:    h.StallTimeout,
+		UnderlayHealthy: h.UnderlayHealthy,
+		Health:          h.Health,
+		Connected:       h.Connected,
 	})
 	go func() { <-ctx.Done(); _ = tunDev.Close() }()
 	return tnet, nil
@@ -227,27 +256,53 @@ func pickV4(ips []netip.Addr) netip.Addr {
 	return ips[0]
 }
 
-// StartWG brings up wg0 with its UDP carried inside under and returns the
-// stack that dials through wg0, plus the MTU chosen for it.
-func StartWG(ctx context.Context, h WGHop, under *netstack.Net) (*netstack.Net, int, error) {
+// WGStack is a running wg0 hop.
+type WGStack struct {
+	// Net dials through wg0.
+	Net *netstack.Net
+	// MTU is the inner MTU chosen for wg0.
+	MTU int
+	dev *device.Device
+}
+
+// Nudge sends a keepalive to the peer now, if a session is current. Call it
+// after the hop below reconnects: WARP1 may come back with a new egress IP, and
+// the wg0 server only learns it from the next packet the client sends.
+func (w *WGStack) Nudge() { w.dev.SendKeepalivesToPeersWithCurrentKeypair() }
+
+const (
+	// endpointRetry spaces out lookups of a hostname Endpoint that has not
+	// resolved yet (WARP1 may still be connecting).
+	endpointRetry = 2 * time.Second
+	// endpointRecheck is how often a resolved hostname Endpoint is looked at
+	// again; it is only re-resolved when wg0 has had no handshake for
+	// endpointStale (the server may have moved, as with dynamic DNS).
+	endpointRecheck = time.Minute
+	endpointStale   = 3 * time.Minute
+)
+
+// StartWG brings up wg0 with its UDP carried inside under. A hostname Endpoint
+// is resolved in the background through the hop below, retried until it works
+// and re-resolved when the handshakes stop, so the chain starts (and the SOCKS
+// port opens) even while WARP1 is still connecting.
+func StartWG(ctx context.Context, h WGHop, under *netstack.Net) (*WGStack, error) {
 	cfg := h.Config
 	host, port, err := SplitEndpoint(cfg.Peers[0].Endpoint)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	rctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	addr, err := resolveEndpoint(rctx, host, h.Resolver)
-	cancel()
-	if err != nil {
-		return nil, 0, fmt.Errorf("wg0: %w", err)
+	var ep netip.AddrPort
+	if a, perr := netip.ParseAddr(host); perr == nil {
+		ep = netip.AddrPortFrom(a.Unmap(), port)
 	}
-	ep := netip.AddrPortFrom(addr, port)
 
 	want := cfg.MTU
 	if h.MTU > 0 {
 		want = h.MTU
 	}
-	mtu := WGMTU(h.UnderMTU, addr.Is6(), want)
+	// A hostname counts as IPv4 until resolved: pickV4 prefers IPv4.
+	endpointV6 := ep.IsValid() && ep.Addr().Is6()
+	mtu := WGMTU(h.UnderMTU, endpointV6, want)
 	if want > mtu {
 		log.Printf("chain: wg0 MTU %d does not fit inside WARP1 (%d); using %d", want, h.UnderMTU, mtu)
 	}
@@ -262,11 +317,11 @@ func StartWG(ctx context.Context, h WGHop, under *netstack.Net) (*netstack.Net, 
 		addrs = append(addrs, a)
 	}
 	if len(addrs) == 0 {
-		return nil, 0, fmt.Errorf("wg0: no usable IPv4 Address at MTU %d", mtu)
+		return nil, fmt.Errorf("wg0: no usable IPv4 Address at MTU %d", mtu)
 	}
 	tunDev, tnet, err := netstack.CreateNetTUN(addrs, cfg.DNS, mtu)
 	if err != nil {
-		return nil, 0, fmt.Errorf("wg0: %w", err)
+		return nil, fmt.Errorf("wg0: %w", err)
 	}
 	keepalive := cfg.Peers[0].PersistentKeepalive
 	if keepalive <= 0 {
@@ -275,21 +330,92 @@ func StartWG(ctx context.Context, h WGHop, under *netstack.Net) (*netstack.Net, 
 	dev := device.NewDevice(tunDev, newNetstackBind(under), device.NewLogger(h.LogLevel, "wg0: "))
 	if err := dev.IpcSet(cfg.UAPI(ep, keepalive)); err != nil {
 		dev.Close()
-		return nil, 0, fmt.Errorf("wg0: config rejected: %w", err)
+		return nil, fmt.Errorf("wg0: config rejected: %w", err)
 	}
 	if err := dev.Up(); err != nil {
 		dev.Close()
-		return nil, 0, fmt.Errorf("wg0: %w", err)
+		return nil, fmt.Errorf("wg0: %w", err)
 	}
-	log.Printf("chain: wg0 started: peer %s, inner MTU %d, keepalive %ds (waiting for handshake)", ep, mtu, keepalive)
+	peer := cfg.Peers[0].Endpoint
+	if ep.IsValid() {
+		peer = ep.String()
+	}
+	log.Printf("chain: wg0 started: peer %s, inner MTU %d, keepalive %ds (waiting for handshake)", peer, mtu, keepalive)
 	go func() { <-ctx.Done(); dev.Close() }()
-	go watchHandshake(ctx, dev, ep)
-	return tnet, mtu, nil
+	go watchHandshake(ctx, dev, peer)
+	if !ep.IsValid() {
+		go followEndpoint(ctx, dev, cfg, host, port, h.Resolver)
+	}
+	return &WGStack{Net: tnet, MTU: mtu, dev: dev}, nil
+}
+
+// followEndpoint keeps wg0's peer pointed at what host resolves to: first
+// until the lookup works, then again whenever the handshakes stop.
+func followEndpoint(ctx context.Context, dev *device.Device, cfg *WGConfig, host string, port uint16, r *doh.Client) {
+	var cur netip.AddrPort
+	t := time.NewTimer(0)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		next := endpointRecheck
+		if !cur.IsValid() || handshakeOlderThan(dev, endpointStale) {
+			rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			addr, err := resolveEndpoint(rctx, host, r)
+			cancel()
+			switch {
+			case err != nil:
+				log.Printf("chain: wg0: %v (retrying)", err)
+				if !cur.IsValid() {
+					next = endpointRetry
+				}
+			case netip.AddrPortFrom(addr, port) != cur:
+				ep := netip.AddrPortFrom(addr, port)
+				if err := dev.IpcSet(cfg.EndpointUAPI(ep)); err != nil {
+					log.Printf("chain: wg0: setting endpoint %s: %v", ep, err)
+					next = endpointRetry
+					break
+				}
+				log.Printf("chain: wg0 endpoint %s -> %s", host, ep)
+				if addr.Is6() {
+					log.Printf("chain: WARNING: wg0 endpoint %s is IPv6 but wg0's MTU was sized for IPv4; lower --wg-mtu by 20 if large packets stall", host)
+				}
+				cur = ep
+			}
+		}
+		t.Reset(next)
+	}
+}
+
+// handshakeOlderThan reports whether wg0's last handshake is older than d (or
+// there was none yet).
+func handshakeOlderThan(dev *device.Device, d time.Duration) bool {
+	s, err := dev.IpcGet()
+	if err != nil {
+		return false
+	}
+	last := lastHandshake(s)
+	return last.IsZero() || time.Since(last) > d
+}
+
+// lastHandshake reads last_handshake_time_sec from wireguard-go's IpcGet output.
+func lastHandshake(uapi string) time.Time {
+	for _, line := range strings.Split(uapi, "\n") {
+		if v, ok := strings.CutPrefix(line, "last_handshake_time_sec="); ok {
+			if sec, err := strconv.ParseInt(v, 10, 64); err == nil && sec > 0 {
+				return time.Unix(sec, 0)
+			}
+		}
+	}
+	return time.Time{}
 }
 
 // watchHandshake logs when wg0 really comes up: dev.Up only starts the
 // device, the peer is reachable once a handshake completes.
-func watchHandshake(ctx context.Context, dev *device.Device, ep netip.AddrPort) {
+func watchHandshake(ctx context.Context, dev *device.Device, peer string) {
 	start := time.Now()
 	warned := false
 	t := time.NewTicker(time.Second)
@@ -301,11 +427,11 @@ func watchHandshake(ctx context.Context, dev *device.Device, ep netip.AddrPort) 
 		case <-t.C:
 		}
 		if s, err := dev.IpcGet(); err == nil && hasHandshake(s) {
-			log.Printf("chain: wg0 up: handshake with %s after %s", ep, time.Since(start).Round(time.Millisecond))
+			log.Printf("chain: wg0 up: handshake with %s after %s", peer, time.Since(start).Round(time.Millisecond))
 			return
 		}
 		if !warned && time.Since(start) > 15*time.Second {
-			log.Printf("chain: WARNING: wg0 has no handshake with %s after 15s (check the keys and endpoint, or the server may drop Cloudflare IPs)", ep)
+			log.Printf("chain: WARNING: wg0 has no handshake with %s after 15s (check the keys and endpoint, or the server may drop Cloudflare IPs)", peer)
 			warned = true
 		}
 	}
