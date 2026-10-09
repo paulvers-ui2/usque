@@ -1,4 +1,4 @@
-name: Build and Release
+name: Final workflow — Build, Release and libusque.so to rethink-app-masque
 
 on:
   push:                        # auto-tag + release on every push to main/b2
@@ -113,3 +113,88 @@ jobs:
             dist/**/*.tar.gz
             dist/**/*.zip
             dist/**/checksums.txt
+
+  # ── Ship the release's Android arm64 binary into the app ─────────────────
+  # Every deploy (a new version tag on main, released above) puts its
+  # android/arm64 build into <owner>/rethink-app-masque as
+  # app/src/main/jniLibs/arm64-v8a/libusque.so. The previous one is kept as
+  # libusque.so.prev; libusque.so.bak is never touched.
+  # Needs secret APP_REPO_TOKEN: a PAT with Contents read/write on the app repo
+  # (GITHUB_TOKEN cannot push to another repo).
+  publish-app:
+    name: Publish libusque.so to rethink-app-masque
+    runs-on: ubuntu-latest
+    needs: [auto-tag, release, publish-release]
+    if: needs.auto-tag.outputs.new_tag != '' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    concurrency:
+      # One deploy at a time pushes to the app, in order.
+      group: publish-libusque-app
+      cancel-in-progress: false
+    env:
+      TAG: ${{ needs.auto-tag.outputs.new_tag }}
+    steps:
+      - name: Download the release's binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: usque-binaries-${{ github.sha }}
+          path: dist/
+
+      - name: Take the android/arm64 binary as libusque.so
+        run: |
+          set -eu
+          bin=$(find dist -type f -name usque -path '*android*arm64*' | head -n1)
+          if [ -z "$bin" ]; then
+            echo "::error::no android/arm64 usque binary among the release's builds"
+            find dist -maxdepth 2 | head -50
+            exit 1
+          fi
+          # ELF magic 7f454c46, e_machine 0x00b7 (AArch64) at offset 18, little-endian.
+          test "$(od -An -tx1 -N4 "$bin" | tr -d ' \n')" = "7f454c46" || { echo "::error::$bin is not an ELF"; exit 1; }
+          test "$(od -An -tx1 -j18 -N2 "$bin" | tr -d ' \n')" = "b700" || { echo "::error::$bin is not AArch64"; exit 1; }
+          grep -q "SOCKS5 proxy over WARP1" "$bin" || { echo "::error::$bin has no chain subcommand"; exit 1; }
+          cp "$bin" libusque.so
+          echo "::notice::$TAG android/arm64: $bin, $(stat -c%s libusque.so) bytes, sha256 $(sha256sum libusque.so | cut -d' ' -f1)"
+
+      - name: Commit it to rethink-app-masque
+        env:
+          APP_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
+          # Same owner as this repo, so a fork publishes into its own app repo.
+          APP_REPO: ${{ github.repository_owner }}/rethink-app-masque
+          APP_BRANCH: main
+          JNI_DIR: app/src/main/jniLibs/arm64-v8a
+          SRC_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          if [ -z "$APP_TOKEN" ]; then
+            echo "::error::Secret APP_REPO_TOKEN is not set. Add a PAT with Contents read/write on $APP_REPO under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          git clone --depth 1 --branch "$APP_BRANCH" "https://x-access-token:${APP_TOKEN}@github.com/${APP_REPO}.git" _app
+          cd _app
+          mkdir -p "$JNI_DIR"
+          if [ -f "$JNI_DIR/libusque.so" ] && ! cmp -s "$JNI_DIR/libusque.so" ../libusque.so; then
+            cp -f "$JNI_DIR/libusque.so" "$JNI_DIR/libusque.so.prev"
+          fi
+          cp -f ../libusque.so "$JNI_DIR/libusque.so"
+          (cd "$JNI_DIR" && sha256sum libusque.so > libusque.so.working.sha256)
+          git add "$JNI_DIR"
+          if git diff --cached --quiet; then
+            echo "::notice::libusque.so on $APP_REPO@$APP_BRANCH already is usque $TAG"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(usque): libusque.so arm64 from usque $TAG (${SRC_SHA:0:7}, release android/arm64 build)"
+          # Always qualify the ref: the app repo also has a tag named "main".
+          pushed=false
+          for i in 1 2 3; do
+            if git push origin "HEAD:refs/heads/${APP_BRANCH}"; then pushed=true; break; fi
+            git pull --rebase origin "refs/heads/${APP_BRANCH}"
+          done
+          if [ "$pushed" != true ]; then
+            echo "::error::could not push libusque.so to $APP_REPO@$APP_BRANCH after 3 tries"
+            exit 1
+          fi
+          echo "::notice::Published usque $TAG android/arm64 to ${APP_REPO}@${APP_BRANCH}/${JNI_DIR}/libusque.so"

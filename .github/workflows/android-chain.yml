@@ -1,6 +1,10 @@
 # Builds libusque.so (android/arm64) WITH the `chain` subcommand, for the
-# rethink-app-masque Chain mode UI, and publishes it straight into the app's
-# app/src/main/jniLibs/arm64-v8a/ (on every push to main, or on demand).
+# rethink-app-masque Chain mode UI. Pull requests only build it.
+#
+# Deploys do NOT come from here: every release ("Final workflow", a new
+# version tag on main) publishes its own android/arm64 build into the app as
+# libusque.so (job publish-app in release.yml). A manual run of this workflow
+# is the escape hatch: it builds any ref and can commit it into the app.
 #
 # Publishing needs a repo secret APP_REPO_TOKEN: a PAT with Contents: read &
 # write on <owner>/rethink-app-masque (GITHUB_TOKEN cannot push to another
@@ -9,13 +13,6 @@
 name: Android chain .so
 
 on:
-  push:
-    branches: [split, main, b2]
-    paths:
-      - '**.go'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/android-chain.yml'
   pull_request:
   workflow_dispatch:
     inputs:
@@ -52,6 +49,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0   # tags, to name the version
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -72,10 +70,20 @@ jobs:
           file out/libusque.so || true
 
       - name: Record build info
+        id: info
+        env:
+          TRIGGER: ${{ github.event_name }}
         run: |
+          SHA=$(git rev-parse HEAD)
+          # The release tag on this commit, if any.
+          TAG=$(git tag --points-at HEAD --sort=-v:refname | head -n1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           {
-            echo "ref: ${{ github.event.inputs.ref || github.ref }}"
-            echo "sha: ${{ github.sha }}"
+            echo "trigger: $TRIGGER"
+            echo "tag: ${TAG:-none}"
+            echo "sha: $SHA"
             echo "go:  $(go version)"
             echo "size: $(stat -c%s out/libusque.so) bytes"
             echo "sha256: $(sha256sum out/libusque.so | cut -d' ' -f1)"
@@ -98,41 +106,32 @@ jobs:
       - name: Upload libusque.so
         uses: actions/upload-artifact@v4
         with:
-          name: libusque-android-arm64-${{ github.sha }}
+          name: libusque-android-arm64-${{ steps.info.outputs.sha }}
           path: |
             out/libusque.so
             out/libusque.so.buildinfo.txt
           retention-days: 30
           if-no-files-found: error
 
-      # On a tag, also attach the .so to the GitHub Release so the app's CI (or
-      # you) can pull a stable URL instead of a per-run artifact.
-      - name: Attach to release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            out/libusque.so
-            out/libusque.so.buildinfo.txt
-
       - name: Publish to rethink-app-masque jniLibs
-        if: >-
-          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-          (github.event_name == 'workflow_dispatch' && inputs.push_to_app)
+        if: github.event_name == 'workflow_dispatch' && inputs.push_to_app
         env:
           APP_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
           # Same owner as this repo, so a fork publishes into its own app repo.
           APP_REPO: ${{ github.repository_owner }}/rethink-app-masque
           APP_BRANCH: ${{ inputs.app_branch || 'main' }}
           JNI_DIR: app/src/main/jniLibs/arm64-v8a
+          SRC_SHA: ${{ steps.info.outputs.short }}
+          SRC_TAG: ${{ steps.info.outputs.tag }}
         run: |
           set -eu
           if [ -z "$APP_TOKEN" ]; then
             echo "::error::Secret APP_REPO_TOKEN is not set. Add a PAT with Contents read/write on $APP_REPO under Settings -> Secrets and variables -> Actions."
             exit 1
           fi
-          SRC_SHA=$(git rev-parse --short HEAD)
-          git clone --depth 1 --branch "$APP_BRANCH"             "https://x-access-token:${APP_TOKEN}@github.com/${APP_REPO}.git" _app
+          SRC="usque@${SRC_SHA}"
+          if [ -n "$SRC_TAG" ]; then SRC="usque ${SRC_TAG} (${SRC_SHA})"; fi
+          git clone --depth 1 --branch "$APP_BRANCH" "https://x-access-token:${APP_TOKEN}@github.com/${APP_REPO}.git" _app
           cd _app
           mkdir -p "$JNI_DIR"
           if [ -f "$JNI_DIR/libusque.so" ] && ! cmp -s "$JNI_DIR/libusque.so" ../out/libusque.so; then
@@ -142,16 +141,21 @@ jobs:
           (cd "$JNI_DIR" && sha256sum libusque.so > libusque.so.working.sha256)
           git add "$JNI_DIR"
           if git diff --cached --quiet; then
-            echo "::notice::libusque.so on $APP_REPO@$APP_BRANCH already matches usque@$SRC_SHA, nothing to commit"
+            echo "::notice::libusque.so on $APP_REPO@$APP_BRANCH already matches $SRC, nothing to commit"
             exit 0
           fi
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore(usque): libusque.so arm64 from usque@${SRC_SHA} (with chain subcommand)"
+          git commit -m "chore(usque): libusque.so arm64 from ${SRC} (with chain subcommand)"
           # Always qualify the ref: the app repo also has a tag named "main".
+          pushed=false
           for i in 1 2 3; do
-            git push origin "HEAD:refs/heads/${APP_BRANCH}" && break
+            if git push origin "HEAD:refs/heads/${APP_BRANCH}"; then pushed=true; break; fi
             git pull --rebase origin "refs/heads/${APP_BRANCH}"
           done
+          if [ "$pushed" != true ]; then
+            echo "::error::Could not push libusque.so to $APP_REPO@$APP_BRANCH after 3 tries"
+            exit 1
+          fi
           git ls-remote origin "refs/heads/${APP_BRANCH}"
-          echo "::notice::Published libusque.so from usque@${SRC_SHA} to ${APP_REPO}@${APP_BRANCH}/${JNI_DIR}"
+          echo "::notice::Published libusque.so from ${SRC} to ${APP_REPO}@${APP_BRANCH}/${JNI_DIR}"
