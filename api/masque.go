@@ -35,12 +35,36 @@ type Underlay struct {
 
 func (u *Underlay) listenPacket(endpoint *net.UDPAddr) (net.PacketConn, error) {
 	if u != nil && u.ListenPacket != nil {
+		// an Underlay socket rides inside another tunnel (the chain): it is not
+		// a real OS socket, so there is no kernel buffer to size here.
 		return u.ListenPacket(endpoint)
 	}
+	bind := &net.UDPAddr{IP: net.IPv4zero}
 	if endpoint.IP.To4() == nil {
-		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6zero})
+		bind = &net.UDPAddr{IP: net.IPv6zero}
 	}
-	return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero})
+	conn, err := net.ListenUDP("udp", bind)
+	if err != nil {
+		return nil, err
+	}
+	raiseUDPBuffers(conn)
+	return conn, nil
+}
+
+// udpSocketBuffer is the receive and send buffer asked of the OS on each real
+// UDP socket. quic-go's throughput is bounded by the socket buffer, and the OS
+// default is small -- quic-go's own docs recommend raising it, most of all on
+// Windows (https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes).
+const udpSocketBuffer = 7 << 20 // 7 MiB
+
+// raiseUDPBuffers enlarges conn's receive and send buffers, best-effort: the
+// OS may clamp the value (rmem_max on Linux), and the tunnel works either way.
+func raiseUDPBuffers(conn *net.UDPConn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.SetReadBuffer(udpSocketBuffer)
+	_ = conn.SetWriteBuffer(udpSocketBuffer)
 }
 
 func (u *Underlay) dialContext(ctx context.Context, network, address string) (net.Conn, error) {

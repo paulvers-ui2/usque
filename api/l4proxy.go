@@ -283,10 +283,16 @@ func (p *L4Proxy) closeClientConnIfCurrent(expected *l4HTTP3Client) {
 }
 
 func listenUDPForEndpoint(endpoint *net.UDPAddr) (*net.UDPConn, error) {
+	bind := &net.UDPAddr{IP: net.IPv4zero}
 	if endpoint.IP.To4() == nil {
-		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6zero})
+		bind = &net.UDPAddr{IP: net.IPv6zero}
 	}
-	return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero})
+	conn, err := net.ListenUDP("udp", bind)
+	if err != nil {
+		return nil, err
+	}
+	raiseUDPBuffers(conn) // quic-go throughput scales with the socket buffer
+	return conn, nil
 }
 
 func closeL4HTTP3(udpConn *net.UDPConn, quicConn *quic.Conn) {
