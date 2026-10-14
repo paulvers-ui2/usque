@@ -115,6 +115,16 @@ var socksCmd = &cobra.Command{
 		if useHTTP2 {
 			config.LogHTTP2Endpoint(endpoint)
 		}
+		// A network that blocks or keeps killing QUIC (UDP 443) moves to HTTP/2
+		// over TCP 443, which looks like any HTTPS site.
+		fallbackAfter, _ := cmd.Flags().GetInt("http2-fallback-after")
+		var fallback net.Addr
+		if !useHTTP2 && fallbackAfter > 0 {
+			if fallback, err = config.SelectEndpointFromConfig(true, useIPv6, connectPort); err != nil {
+				log.Printf("Warning: no HTTP/2 fallback endpoint (%v); staying on QUIC", err)
+				fallbackAfter = 0
+			}
+		}
 
 		tunnelIPv4, err := cmd.Flags().GetBool("no-tunnel-ipv4")
 		if err != nil {
@@ -271,6 +281,9 @@ var socksCmd = &cobra.Command{
 			WatchPath:         res.watchNetwork,
 			Probe:             probe,
 			StallTimeout:      res.stallTimeout,
+
+			FallbackHTTP2Endpoint: fallback,
+			FallbackHTTP2After:    fallbackAfter,
 		})
 
 		// DoH queries go through the tunnel, or over the host network with -l.
@@ -341,6 +354,7 @@ func init() {
 	socksCmd.Flags().String("on-connect", "", "Path to an executable to run after each successful tunnel connect (no args; context via USQUE_* env vars)")
 	socksCmd.Flags().String("on-disconnect", "", "Path to an executable to run after each tunnel disconnect (no args; context via USQUE_* env vars)")
 	addDoHFlags(socksCmd)
+	socksCmd.Flags().Int("http2-fallback-after", 2, "Switch from QUIC to HTTP/2 after this many failed or short-lived (<60s) QUIC connections in a row, for networks that block or keep killing UDP 443 (0 = never)")
 	addResilienceFlags(socksCmd)
 	rootCmd.AddCommand(socksCmd)
 }

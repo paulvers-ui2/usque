@@ -182,7 +182,7 @@ func init() {
 	f.Int("wg-mtu", 0, "wg0 inner MTU; 0 = the config's MTU. Always capped to what fits inside WARP1 (-m minus 60, or 80 for an IPv6 endpoint)")
 	f.Int("exit-mtu", 1280, "WARP2 (exit) tunnel MTU")
 	f.Int("exit-connect-port", 443, "Port for the WARP2 MASQUE connection (inside wg0)")
-	f.Int("http2-fallback-after", 2, "WARP1: switch from QUIC to HTTP/2 after this many failed connects in a row, for networks that block UDP 443 (0 = never)")
+	f.Int("http2-fallback-after", 2, "WARP1: switch from QUIC to HTTP/2 after this many failed or short-lived (<60s) QUIC connections in a row, for networks that block or keep killing UDP 443 (0 = never)")
 	f.StringP("sni-address", "s", internal.ConnectSNI, "SNI for WARP1 (the only hop the ISP sees)")
 	f.IntP("connect-port", "P", 443, "Port for the WARP1 MASQUE connection")
 	f.BoolP("ipv6", "6", false, "Use IPv6 for the WARP1 MASQUE connection")

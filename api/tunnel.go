@@ -153,6 +153,10 @@ func NewWaterAdapter(iface *water.Interface) TunnelDevice {
 	return &WaterAdapter{iface: iface}
 }
 
+// quicShortLived: a QUIC connection lost sooner than this after connecting
+// counts toward FallbackHTTP2After, as a failed connect does.
+const quicShortLived = 60 * time.Second
+
 // deviceErrorBackoff spaces out retries after the TUN device fails a read, so a
 // closed device cannot spin the reader.
 const deviceErrorBackoff = 100 * time.Millisecond
@@ -478,7 +482,7 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 		}
 
 		log.Println("Connected to MASQUE server")
-		quicFailures = 0
+		connectedAt := time.Now()
 		health.setConnected(true)
 		ipConn := conn.ipConn
 		// Fixed for this connection's pumps, even if a later iteration falls back.
@@ -594,6 +598,22 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 		err = <-errChan
 		log.Printf("Tunnel connection lost: %v. Reconnecting...", err)
 		health.setConnected(false)
+		// A QUIC connection that dies soon after it came up counts as a failed
+		// connect: a network that lets QUIC connect and then kills it (an ISP
+		// resetting or blackholing UDP 443 after a few seconds) never failed a
+		// connect, so the HTTP/2 fallback never kicked in and the tunnel kept
+		// dropping. One that lived a while resets the count.
+		if !connHTTP2 && cfg.FallbackHTTP2After > 0 {
+			if time.Since(connectedAt) < quicShortLived {
+				quicFailures++
+				if quicFailures >= cfg.FallbackHTTP2After {
+					log.Printf("QUIC connections died within %s %d times in a row; falling back to HTTP/2 via %s", quicShortLived, quicFailures, cfg.FallbackHTTP2Endpoint)
+					endpoint, useHTTP2 = cfg.FallbackHTTP2Endpoint, true
+				}
+			} else {
+				quicFailures = 0
+			}
+		}
 
 		if cfg.OnDisconnect != "" {
 			env := cloneHookEnv(cfg.HookEnv)
