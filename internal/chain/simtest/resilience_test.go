@@ -298,9 +298,11 @@ func TestSilentDropIsRebuiltQuickly(t *testing.T) {
 	if r.sessions.Load() < 2 {
 		t.Fatal("the connection after the drop did not use a new session")
 	}
-	// Stall noticed after ~1-2s, probe fails after 2.5s, reconnect is immediate,
-	// then the dial's next SYN retransmission (at ~7s) gets through.
-	if took > 15*time.Second {
+	// Stall noticed after ~1-2s, two probes fail after 5s each (one unanswered
+	// probe no longer drops a tunnel: under load that dropped working ones),
+	// reconnect is immediate, then the dial's next SYN retransmission (at
+	// ~15s) gets through.
+	if took > 22*time.Second {
 		t.Fatalf("recovered after %s, want well under QUIC's 30s idle timeout", took)
 	}
 	t.Logf("recovered from a silent drop in %s", took.Round(100*time.Millisecond))
