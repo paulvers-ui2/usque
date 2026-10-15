@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -128,5 +129,41 @@ func TestConnectTimeoutBoundsHTTP2Dial(t *testing.T) {
 	}
 	if took := time.Since(start); took > 3*time.Second {
 		t.Fatalf("connect gave up after %v, want about 300ms", took)
+	}
+}
+
+// A single unanswered probe used to drop a working tunnel; it takes
+// stallProbes in a row, and anything received meanwhile starts over.
+func TestWatchHealthNeedsProbesInARow(t *testing.T) {
+	var h Health
+	h.setConnected(true)
+	h.pending.Store(monoNow() - int64(time.Second)) // nothing back for a second
+
+	var probes atomic.Int32
+	answerOnFirst := atomic.Bool{}
+	answerOnFirst.Store(true)
+	probe := func(context.Context) error {
+		if probes.Add(1) == 1 && answerOnFirst.Load() {
+			h.received() // traffic came back while the probe waited
+			h.sent()
+		}
+		return errors.New("timeout")
+	}
+	lost := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go watchHealth(ctx, &h, nil, probe, 10*time.Millisecond, nil, lost)
+
+	select {
+	case err := <-lost:
+		if !errors.Is(err, errStalled) {
+			t.Fatalf("lost: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("never dropped a tunnel that stays silent")
+	}
+	// probe 1 was answered by traffic; probes 2 and 3 were the misses in a row
+	if n := probes.Load(); n != 1+stallProbes {
+		t.Fatalf("dropped after %d probes, want %d", n, 1+stallProbes)
 	}
 }

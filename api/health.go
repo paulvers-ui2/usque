@@ -19,7 +19,13 @@ import (
 //   - the network path changed: the local address the OS would use to reach the
 //     endpoint is different (or the network just came back after an outage);
 //   - the tunnel stalled: packets went out but nothing came back for a while, and
-//     a TCP probe through the tunnel got no answer either.
+//     stallProbes TCP probes in a row through the tunnel got no answer either,
+//     with nothing at all received meanwhile.
+//
+// One unanswered probe is not enough: on a busy or long path (the chain runs
+// three tunnels inside each other) a probe can wait behind queued traffic for
+// seconds, and tearing down a working tunnel for it dropped every connection
+// on it, every minute or so.
 
 var (
 	// errPathChanged and errStalled end a connection that is (almost certainly)
@@ -33,8 +39,12 @@ const (
 	// stall clock. Also the worst-case delay before a path change is noticed.
 	healthTick = time.Second
 	// minProbeTimeout bounds a liveness probe from below; a probe through the
-	// tunnel costs one round trip, which can be a second or more on mobile data.
-	minProbeTimeout = 2500 * time.Millisecond
+	// tunnel costs one round trip, which can be a second or more on mobile data,
+	// and more behind a full queue or through the chain's three tunnels.
+	minProbeTimeout = 5 * time.Second
+	// stallProbes is how many probes in a row must go unanswered, with nothing
+	// received meanwhile, before a stalled connection is dropped.
+	stallProbes = 2
 	// healthyStallGrace is how long an unanswered packet may wait before Healthy
 	// stops vouching for the tunnel (used by the hop above to hold off its own
 	// probes while this one recovers).
@@ -185,6 +195,7 @@ func watchHealth(ctx context.Context, h *Health, path *pathWatch, probe func(con
 	t := time.NewTicker(healthTick)
 	defer t.Stop()
 	var lastProbe time.Time
+	failed := 0 // unanswered probes in a row
 	for {
 		select {
 		case <-ctx.Done():
@@ -201,8 +212,12 @@ func watchHealth(ctx context.Context, h *Health, path *pathWatch, probe func(con
 			continue
 		}
 		waiting := h.unansweredFor()
-		if waiting < stall || time.Since(lastProbe) < stall {
+		if waiting < stall {
+			failed = 0
 			continue
+		}
+		if failed == 0 && time.Since(lastProbe) < stall {
+			continue // after a miss, the next probe goes at once
 		}
 		if underlayHealthy != nil && !underlayHealthy() {
 			// The tunnel underneath is itself down or recovering; tearing this one
@@ -210,15 +225,24 @@ func watchHealth(ctx context.Context, h *Health, path *pathWatch, probe func(con
 			continue
 		}
 		lastProbe = time.Now()
+		oldest := h.pending.Load()
 		pctx, cancel := context.WithTimeout(ctx, probeTimeout(stall))
 		err := probe(pctx)
 		cancel()
 		if ctx.Err() != nil {
 			return
 		}
-		if err != nil {
-			lost <- fmt.Errorf("%w: nothing received for %s and %v", errStalled, waiting.Round(100*time.Millisecond), err)
-			return
+		if err == nil || h.pending.Load() != oldest {
+			// answered, or something came back meanwhile: alive, maybe slow
+			failed = 0
+			continue
 		}
+		failed++
+		if failed < stallProbes {
+			continue
+		}
+		lost <- fmt.Errorf("%w: nothing received for %s and %d probes unanswered: %v",
+			errStalled, h.unansweredFor().Round(100*time.Millisecond), failed, err)
+		return
 	}
 }
