@@ -279,7 +279,7 @@ func waitFor(t *testing.T, within time.Duration, what string, ok func() bool) ti
 
 // The path dies silently while a connection is being opened. Without the stall
 // check nothing notices until QUIC's 30s idle timeout; with it the tunnel is
-// rebuilt in a few seconds and the waiting connection goes through.
+// rebuilt well before that and the waiting connection goes through.
 func TestSilentDropIsRebuiltQuickly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
@@ -290,6 +290,15 @@ func TestSilentDropIsRebuiltQuickly(t *testing.T) {
 
 	r.n.cut()
 	start := time.Now()
+	// The dial below is what sends packets into the dead path, so the rebuild is
+	// timed alongside it rather than after it.
+	var rebuiltAfter atomic.Int64
+	go func() {
+		for ctx.Err() == nil && r.sessions.Load() < 2 {
+			time.Sleep(50 * time.Millisecond)
+		}
+		rebuiltAfter.Store(int64(time.Since(start)))
+	}()
 	got := dialEchoThrough(ctx, t, r.tnet, r.origin)
 	took := time.Since(start)
 	if !has(got, "seen-from=172.16.0.2") {
@@ -298,12 +307,21 @@ func TestSilentDropIsRebuiltQuickly(t *testing.T) {
 	if r.sessions.Load() < 2 {
 		t.Fatal("the connection after the drop did not use a new session")
 	}
-	// Stall noticed after ~1-2s, probe fails after 2.5s, reconnect is immediate,
-	// then the dial's next SYN retransmission (at ~7s) gets through.
-	if took > 15*time.Second {
-		t.Fatalf("recovered after %s, want well under QUIC's 30s idle timeout", took)
+	// The stall is noticed after the 1s stall time (checked every second), then
+	// api.stallProbes probes of api's minProbeTimeout (5s) must go unanswered:
+	// the tunnel is rebuilt ~11-12s after the drop. Timed on the tunnel itself,
+	// not on the dial, whose SYN retries back off to 1, 3, 7, 15s: a rebuild at
+	// 11s is only used by the 15s retry, which put the old dial-based check
+	// (took <= 15s) a millisecond over the line on every run.
+	rebuilt := time.Duration(rebuiltAfter.Load())
+	if rebuilt == 0 || rebuilt > 14*time.Second {
+		t.Fatalf("tunnel rebuilt %s after the drop (0 = not seen), want within 14s", rebuilt)
 	}
-	t.Logf("recovered from a silent drop in %s", took.Round(100*time.Millisecond))
+	if took > 25*time.Second {
+		t.Fatalf("the waiting connection got through after %s, want well under QUIC's 30s idle timeout", took)
+	}
+	t.Logf("tunnel rebuilt %s after a silent drop, waiting connection through after %s",
+		rebuilt.Round(100*time.Millisecond), took.Round(100*time.Millisecond))
 }
 
 // Switching networks (Wi-Fi -> mobile data) reconnects within about a second,
