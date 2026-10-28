@@ -57,6 +57,10 @@ var chainCmd = &cobra.Command{
 		insecure := boolean("insecure")
 		mtu1 := integer("mtu")
 		res := readResilienceFlags(cmd)
+		// Both WARP hops rebuild a lost tunnel at once unless told otherwise: WARP1
+		// carries wg0's keepalives and WARP2 the proxied apps, so waiting for
+		// outbound traffic first only stretches the outage.
+		alwaysReconnect := boolean("always-reconnect")
 
 		// Each hop's health is watched by the hop above it, which then leaves
 		// the recovery to the hop below instead of rebuilding itself on top.
@@ -69,7 +73,7 @@ var chainCmd = &cobra.Command{
 			Name: "warp1", Config: &config.AppConfig, SNI: str("sni-address"),
 			UseHTTP2: boolean("http2"), UseIPv6: boolean("ipv6"), ConnectPort: integer("connect-port"),
 			InitialPacketSize: ips, MTU: mtu1, Keepalive: dur("keepalive-period"),
-			ReconnectDelay: dur("reconnect-delay"), AlwaysReconnect: true, Insecure: insecure,
+			ReconnectDelay: dur("reconnect-delay"), AlwaysReconnect: alwaysReconnect, Insecure: insecure,
 			FallbackHTTP2After: integer("http2-fallback-after"),
 			IdleTimeout:        res.idleTimeout, ConnectTimeout: res.connectTimeout,
 			WatchPath: res.watchNetwork, StallTimeout: res.stallTimeout,
@@ -130,7 +134,7 @@ var chainCmd = &cobra.Command{
 			Name: "warp2", Config: exitCfg, SNI: str("exit-sni"),
 			UseHTTP2: exitHTTP2, ConnectPort: integer("exit-connect-port"), InitialPacketSize: exitIPS, MTU: exitMTU,
 			Keepalive: dur("keepalive-period"), ReconnectDelay: dur("reconnect-delay"),
-			AlwaysReconnect: true, Insecure: insecure,
+			AlwaysReconnect: alwaysReconnect, Insecure: insecure,
 			IdleTimeout: res.idleTimeout, ConnectTimeout: res.connectTimeout,
 			StallTimeout: dur("exit-stall-timeout"), ProbeAddr: res.probeTarget(configAddrs(exitCfg)),
 			UnderlayHealthy: warp1Health.Healthy,
@@ -168,7 +172,13 @@ var chainCmd = &cobra.Command{
 }
 
 func init() {
-	f := chainCmd.Flags()
+	defineChainFlags(chainCmd)
+	rootCmd.AddCommand(chainCmd)
+}
+
+// defineChainFlags registers the chain's flags on c (chainCmd, or a fresh command in tests).
+func defineChainFlags(c *cobra.Command) {
+	f := c.Flags()
 	f.StringP("bind", "b", "127.0.0.1", "Address to bind the SOCKS proxy to")
 	f.StringP("port", "p", "1080", "Port to listen on for SOCKS proxy")
 	f.StringP("username", "u", "", "SOCKS username")
@@ -194,9 +204,11 @@ func init() {
 	f.Duration("udp-timeout", 60*time.Second, "Idle deadline for SOCKS5 UDP relays")
 	f.Bool("insecure", false, "Disable endpoint certificate pinning (testing only)")
 	f.Duration("exit-stall-timeout", 8*time.Second, "Like --stall-timeout, for WARP2 (inside wg0); only checked while WARP1 is healthy")
-	addDoHFlags(chainCmd)
-	addResilienceFlags(chainCmd)
-	rootCmd.AddCommand(chainCmd)
+	// Same flag as socks, http-proxy and nativetun, so one app flag set fits every mode.
+	// Default true: the chain always did this, the flag only makes it explicit.
+	f.Bool("always-reconnect", true, "Rebuild WARP1 and WARP2 right after a tunnel loss, even when idle (default; =false waits for outbound traffic)")
+	addDoHFlags(c)
+	addResilienceFlags(c)
 }
 
 // chainKeys loads the wg0 config and the WARP2 identity, from the stdin key
