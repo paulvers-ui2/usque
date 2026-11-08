@@ -302,6 +302,8 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
 	tlsConfig.NextProtos = []string{"h2"}
 
 	if proxyURL == nil || ul != nil {
+		//nolint:staticcheck // SA1019: x/net v0.61 deprecates http2.Transport in favour of
+		// http.Transport{Protocols}; migrating needs on-device MASQUE testing, so keep it for now.
 		transport := &http2.Transport{
 			// Ping an idle connection so a dead tunnel underneath (e.g. a hop
 			// of the chain) is noticed instead of hanging forever.

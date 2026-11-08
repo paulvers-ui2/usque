@@ -22,7 +22,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: '>=1.26' # newest patched Go: stdlib security fixes ship in point releases          check-latest: true
 
       - name: Verify modules
         run: go mod verify
