@@ -1,0 +1,5 @@
+# Reviewed 2026-11-08: WireGuard keys in unit-test fixtures only
+# (cmd/secrets_test.go uses the public WireGuard docs example key).
+# Only these exact findings are ignored; any new secret still fails CI.
+a028f23a3b3e24d94a936354836ace66dd692697:cmd/secrets_test.go:generic-api-key:9
+d5af1bc63dedb44665ddc52cdd1fe503bd7c624f:internal/chain/chain_test.go:generic-api-key:9
