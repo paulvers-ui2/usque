@@ -36,7 +36,7 @@ jobs:
           go version
           # x/net < v0.60.0 and x/text < v0.39.0 carry GO-2026-6617, -6612, -6611,
           # -6610, -6603 (fixed x/net 0.60.0), -5026, -4918; GO-2026-5970 (x/text).
-          step "go get" go get golang.org/x/net@v0.61.0 golang.org/x/text@v0.40.0
+          step "go get" go get golang.org/x/net@v0.61.0  # pulls x/text v0.43.0 (>= v0.39.0 fixes GO-2026-5970)
           step "go mod tidy" go mod tidy
           step "go mod verify" go mod verify
           step "go build" go build ./...
@@ -46,7 +46,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add go.mod go.sum
           echo "::notice title=go.mod diff::$(git diff --cached go.mod | grep -E '^[-+]\s' | tr '\n' ' ' | cut -c1-2000)"
-          step "git commit" git commit -m "deps: golang.org/x/net v0.61.0, golang.org/x/text v0.40.0
+          step "git commit" git commit -m "deps: golang.org/x/net v0.61.0 (+ x/text v0.43.0 it requires)
 
           Same fixes as firestack (paulvers-ui2/firestack fix/xnet-vulns):
           GO-2026-6617, GO-2026-6612, GO-2026-6611, GO-2026-6610, GO-2026-6603,
