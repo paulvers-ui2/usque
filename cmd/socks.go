@@ -119,7 +119,10 @@ var socksCmd = &cobra.Command{
 		// over TCP 443, which looks like any HTTPS site.
 		fallbackAfter, _ := cmd.Flags().GetInt("http2-fallback-after")
 		var fallback net.Addr
-		if !useHTTP2 && fallbackAfter > 0 {
+		if useHTTP2 {
+			fallbackAfter = 0 // already on HTTP/2: nothing to fall back to
+		}
+		if fallbackAfter > 0 {
 			if fallback, err = config.SelectEndpointFromConfig(true, useIPv6, connectPort); err != nil {
 				log.Printf("Warning: no HTTP/2 fallback endpoint (%v); staying on QUIC", err)
 				fallbackAfter = 0

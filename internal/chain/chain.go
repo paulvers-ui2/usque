@@ -154,11 +154,15 @@ func startWarpTLS(ctx context.Context, h WarpHop, tlsConfig *tls.Config, under *
 		transport = "HTTP/2"
 	}
 	var fallback net.Addr
-	if !h.UseHTTP2 && h.FallbackHTTP2After > 0 {
+	fallbackAfter := h.FallbackHTTP2After
+	if h.UseHTTP2 {
+		fallbackAfter = 0 // already on HTTP/2: nothing to fall back to
+	}
+	if fallbackAfter > 0 {
 		if fallback, err = c.SelectEndpoint(true, h.UseIPv6, h.ConnectPort); err != nil {
 			return nil, fmt.Errorf("%s: HTTP/2 fallback endpoint: %w", h.Name, err)
 		}
-		transport = fmt.Sprintf("HTTP/3 (HTTP/2 after %d failed connects)", h.FallbackHTTP2After)
+		transport = fmt.Sprintf("HTTP/3 (HTTP/2 after %d failed connects)", fallbackAfter)
 	}
 	log.Printf("chain: %s up: %s via %s, tunnel MTU %d", h.Name, endpoint, transport, h.MTU)
 	var probe func(context.Context) error
@@ -178,7 +182,7 @@ func startWarpTLS(ctx context.Context, h WarpHop, tlsConfig *tls.Config, under *
 		Underlay:          UnderlayOf(under),
 
 		FallbackHTTP2Endpoint: fallback,
-		FallbackHTTP2After:    h.FallbackHTTP2After,
+		FallbackHTTP2After:    fallbackAfter,
 
 		IdleTimeout:     h.IdleTimeout,
 		ConnectTimeout:  h.ConnectTimeout,

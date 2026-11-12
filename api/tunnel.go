@@ -395,6 +395,12 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			log.Fatalf("MaintainTunnel: HTTP/3 mode requires a *net.UDPAddr endpoint, got %T", cfg.Endpoint)
 		}
 	}
+	// The HTTP/2 fallback only applies to an HTTP/3 tunnel. With --http2 the
+	// caller leaves FallbackHTTP2Endpoint nil while --http2-fallback-after keeps
+	// its default (2), which used to make this check kill the process at start.
+	if cfg.UseHTTP2 {
+		cfg.FallbackHTTP2After = 0
+	}
 	if cfg.FallbackHTTP2After > 0 {
 		if _, ok := cfg.FallbackHTTP2Endpoint.(*net.TCPAddr); !ok {
 			log.Fatalf("MaintainTunnel: the HTTP/2 fallback requires a *net.TCPAddr endpoint, got %T", cfg.FallbackHTTP2Endpoint)
