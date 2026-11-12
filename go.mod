@@ -2,6 +2,8 @@ module github.com/Diniboy1123/usque
 
 go 1.26.3
 
+toolchain go1.26.11
+
 require (
 	github.com/Diniboy1123/connect-ip-go v0.0.0-20260613064811-66cba32d7d33
 	github.com/quic-go/quic-go v0.60.0
