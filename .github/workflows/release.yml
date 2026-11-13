@@ -223,3 +223,65 @@ jobs:
             exit 1
           fi
           echo "::notice::Published usque $TAG android/arm64 to ${APP_REPO}@${APP_BRANCH}/${JNI_DIR}/libusque.so"
+
+  # ── Pin the release in port1897 (AuroraVPN for Windows) ──────────────────
+  # port1897 does not download a binary: its windows.yml and app.yml build
+  # usque.exe from source at the commit in USQUE_REF. Every deploy rewrites
+  # that pin to the released commit and commits it to port1897 main, which
+  # makes port1897's App workflow publish a new AuroraVPN release with it.
+  # Needs secret PORT_REPO_TOKEN (or APP_REPO_TOKEN if it covers both repos):
+  # a PAT with Contents: read & write AND Workflows: read & write on port1897
+  # (it edits files under .github/workflows/, which GitHub refuses otherwise).
+  publish-port1897:
+    name: Pin usque release in port1897
+    runs-on: ubuntu-latest
+    needs: [auto-tag, release, publish-release]
+    if: >-
+      always() && needs.publish-release.result == 'success' &&
+      ((needs.auto-tag.outputs.new_tag != '' && github.ref == 'refs/heads/main') ||
+       github.event_name == 'release')
+    permissions:
+      contents: read
+    concurrency:
+      group: publish-usque-port1897
+      cancel-in-progress: false
+    env:
+      TAG: ${{ needs.auto-tag.outputs.new_tag || github.event.release.tag_name }}
+      SRC_SHA: ${{ github.sha }}
+    steps:
+      - name: Point port1897 at this release
+        env:
+          TOKEN: ${{ secrets.PORT_REPO_TOKEN || secrets.APP_REPO_TOKEN }}
+          PORT_REPO: ${{ github.repository_owner }}/port1897
+          PORT_BRANCH: main
+        run: |
+          set -eu
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Set PORT_REPO_TOKEN: a PAT with Contents and Workflows read/write on $PORT_REPO."
+            exit 1
+          fi
+          git clone --depth 1 --branch "$PORT_BRANCH" "https://x-access-token:${TOKEN}@github.com/${PORT_REPO}.git" _port
+          cd _port
+          files=".github/workflows/windows.yml .github/workflows/app.yml"
+          for f in $files; do
+            grep -q 'USQUE_REF:' "$f" || { echo "::error::$f has no USQUE_REF line"; exit 1; }
+            sed -i -E "s|^([[:space:]]*USQUE_REF:).*|\1 ${SRC_SHA} # usque ${TAG}|" "$f"
+          done
+          git add $files
+          if git diff --cached --quiet; then
+            echo "::notice::port1897 already builds usque $TAG"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(usque): build usque.exe from usque ${TAG} (${SRC_SHA:0:7})"
+          pushed=false
+          for i in 1 2 3; do
+            if git push origin "HEAD:refs/heads/${PORT_BRANCH}"; then pushed=true; break; fi
+            git pull --rebase origin "refs/heads/${PORT_BRANCH}"
+          done
+          if [ "$pushed" != true ]; then
+            echo "::error::could not push to $PORT_REPO@$PORT_BRANCH after 3 tries"
+            exit 1
+          fi
+          echo "::notice::port1897 now builds usque $TAG (${SRC_SHA})"
