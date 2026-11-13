@@ -229,7 +229,7 @@ jobs:
   # usque.exe from source at the commit in USQUE_REF. Every deploy rewrites
   # that pin to the released commit and commits it to port1897 main, which
   # makes port1897's App workflow publish a new AuroraVPN release with it.
-  # Needs secret PORT_REPO_TOKEN (or APP_REPO_TOKEN if it covers both repos):
+  # Needs secret USQUE_TO1897:
   # a PAT with Contents: read & write AND Workflows: read & write on port1897
   # (it edits files under .github/workflows/, which GitHub refuses otherwise).
   publish-port1897:
@@ -251,13 +251,13 @@ jobs:
     steps:
       - name: Point port1897 at this release
         env:
-          TOKEN: ${{ secrets.PORT_REPO_TOKEN || secrets.APP_REPO_TOKEN }}
+          TOKEN: ${{ secrets.USQUE_TO1897 }}
           PORT_REPO: ${{ github.repository_owner }}/port1897
           PORT_BRANCH: main
         run: |
           set -eu
           if [ -z "$TOKEN" ]; then
-            echo "::error::Set PORT_REPO_TOKEN: a PAT with Contents and Workflows read/write on $PORT_REPO."
+            echo "::error::Set USQUE_TO1897: a PAT with Contents and Workflows read/write on $PORT_REPO."
             exit 1
           fi
           git clone --depth 1 --branch "$PORT_BRANCH" "https://x-access-token:${TOKEN}@github.com/${PORT_REPO}.git" _port
